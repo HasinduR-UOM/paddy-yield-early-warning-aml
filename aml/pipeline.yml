@@ -38,7 +38,7 @@ jobs:
 
   train:
     type: command
-    display_name: tune 8 models, evaluate, save
+    display_name: tune 9 models incl. NGBoost, calibrate, evaluate, save
     code: ../
     environment: azureml:paddy-env@latest
     command: >-

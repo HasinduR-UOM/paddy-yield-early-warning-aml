@@ -17,11 +17,11 @@ mlruns/
 monitoring/current.csv
 gate_report.md
 
-# Data and models are versioned as Azure ML data and model assets, not in git
+# Raw data and most models are versioned as Azure ML data and model assets, not in git.
+# The processed model table and the selected model are kept, so the notebooks and the
+# app run straight after cloning.
 data/raw/*/
 data/interim/*.csv
-data/processed/*.csv
-artifacts/models/
-artifacts/app_metadata.json
-artifacts/train_sample.csv
-artifacts/test_predictions.csv
+artifacts/models/*
+!artifacts/models/final_model.joblib
+!artifacts/models/best_model_train_only.joblib

@@ -5,8 +5,9 @@ Request (one object or a list):
      "rain_pct_of_normal": 60, "fertilizer_crisis": 0, "overrides": {"sown_ha": 70000}}
 Only district and season are required.
 
-Response: one object per request with the forecast (kg/ha), the district's
-5-season mean, the % change and the shortfall flag. Inputs and outputs are
+Response: one object per request with the forecast (kg/ha), its 80 % interval,
+the district's 5-season mean, the % change, the probability of a shortfall and
+the shortfall flag. Inputs and outputs are
 sent to the deployment's data collector, which the weekly drift job reads.
 """
 from __future__ import annotations
@@ -22,7 +23,7 @@ import joblib
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.inference import build_row  # noqa: E402
+from src.inference import build_row, forecast  # noqa: E402
 
 MODEL = META = None
 COLLECT_IN = COLLECT_OUT = None
@@ -50,12 +51,17 @@ def predict_one(req: dict) -> tuple[pd.DataFrame, dict]:
     X, d = build_row(META, req["district"], req["season"], req.get("season_year"),
                      float(req.get("rain_pct_of_normal", 100.0)), int(req.get("fertilizer_crisis", 0)),
                      req.get("overrides"))
-    pred = float(MODEL.predict(X)[0])
-    ref = float(d["yield_mean5_same"])
+    f = forecast(MODEL, META, X, float(d["yield_mean5_same"]))
+    lo, hi = f["interval_80"] or (None, None)
     return X, {"request_id": str(uuid.uuid4()), "district": req["district"], "season": req["season"],
-               "yield_kg_ha": round(pred, 1), "five_season_mean_kg_ha": round(ref, 1),
-               "change_pct": round(100 * (pred / ref - 1), 2),
-               "shortfall": bool(pred < META["shortfall_threshold"] * ref)}
+               "yield_kg_ha": round(f["yield_kg_ha"], 1),
+               "interval_80_low": None if lo is None else round(lo, 1),
+               "interval_80_high": None if hi is None else round(hi, 1),
+               "five_season_mean_kg_ha": round(f["five_season_mean_kg_ha"], 1),
+               "change_pct": round(f["change_pct"], 2),
+               "shortfall_probability": None if f["shortfall_probability"] is None
+               else round(f["shortfall_probability"], 4),
+               "shortfall": f["shortfall"]}
 
 
 def run(raw_data: str):

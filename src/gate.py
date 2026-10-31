@@ -6,7 +6,9 @@
 The champion's metrics come from the tags of the Azure ML model version that
 carries champion=true (the train workflow writes them to champion.json). If
 there is no champion yet, the first model passes. Metric and tolerance are
-set in params.yaml (default: test RMSE on normal seasons, lower is better).
+set in params.yaml (default: CRPS of the NGBoost forecast distribution on normal
+seasons, lower is better). A champion that has no value for the metric (for
+example an older point model) is treated as "no champion yet".
 """
 from __future__ import annotations
 
@@ -19,7 +21,8 @@ import yaml
 
 from . import config as C
 
-ROWS = ["test_rmse_normal", "test_mape_normal", "test_r2_normal", "test_rmse", "cv_rmse"]
+ROWS = ["test_crps_normal", "test_crps", "test_rmse_normal", "test_mape_normal", "test_r2_normal", "test_rmse",
+        "cv_rmse", "shortfall_recall", "shortfall_pr_auc"]
 
 
 def load(path: str | None) -> dict | None:
@@ -48,8 +51,8 @@ def main(argv: list[str] | None = None) -> int:
     if champion is None or champion.get(metric) is None:
         passed, why = True, "No champion yet, so the first model passes."
     else:
-        passed = float(challenger[metric]) <= float(champion[metric]) + tol
-        why = (f"{metric}: challenger {challenger[metric]} vs champion {float(champion[metric]):.2f}. "
+        passed = challenger.get(metric) is not None and float(challenger[metric]) <= float(champion[metric]) + tol
+        why = (f"{metric}: challenger {challenger.get(metric)} vs champion {float(champion[metric]):.2f}. "
                + ("PASS" if passed else "FAIL: the new model is worse, the champion stays."))
     lines += ["", f"**Result: {'PASS' if passed else 'FAIL'}** - {why}", "",
               f"Challenger: {challenger['best_model']}"

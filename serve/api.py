@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from src.inference import build_row  # noqa: E402
+from src.inference import build_row, forecast  # noqa: E402
 
 ART = Path(os.getenv("ARTIFACTS_DIR", ROOT / "artifacts"))
 MODEL_VERSION = os.getenv("MODEL_VERSION", "dev")
@@ -31,7 +31,8 @@ META = json.loads((ART / "app_metadata.json").read_text())
 MODEL = joblib.load(ART / "models" / "final_model.joblib")
 
 app = FastAPI(title="Sri Lanka paddy yield forecast", version=MODEL_VERSION,
-              description="Pre-harvest district paddy yield (kg/ha) with a shortfall flag.")
+              description="Pre-harvest district paddy yield (kg/ha) with an 80 % interval, "
+                          "a shortfall probability and a shortfall flag.")
 
 
 class PredictRequest(BaseModel):
@@ -47,8 +48,11 @@ class PredictResponse(BaseModel):
     request_id: str
     model_version: str
     yield_kg_ha: float
+    interval_80_low: float | None = None
+    interval_80_high: float | None = None
     five_season_mean_kg_ha: float
     change_pct: float
+    shortfall_probability: float | None = None
     shortfall: bool
 
 
@@ -78,11 +82,17 @@ def predict(req: PredictRequest):
                          req.fertilizer_crisis, req.overrides)
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
-    pred = float(MODEL.predict(X)[0])
-    ref = float(d["yield_mean5_same"])
-    out = PredictResponse(request_id=str(uuid.uuid4()), model_version=MODEL_VERSION, yield_kg_ha=round(pred, 1),
-                          five_season_mean_kg_ha=round(ref, 1), change_pct=round(100 * (pred / ref - 1), 2),
-                          shortfall=pred < META["shortfall_threshold"] * ref)
+    f = forecast(MODEL, META, X, float(d["yield_mean5_same"]))
+    lo, hi = f["interval_80"] or (None, None)
+    out = PredictResponse(request_id=str(uuid.uuid4()), model_version=MODEL_VERSION,
+                          yield_kg_ha=round(f["yield_kg_ha"], 1),
+                          interval_80_low=None if lo is None else round(lo, 1),
+                          interval_80_high=None if hi is None else round(hi, 1),
+                          five_season_mean_kg_ha=round(f["five_season_mean_kg_ha"], 1),
+                          change_pct=round(f["change_pct"], 2),
+                          shortfall_probability=None if f["shortfall_probability"] is None
+                          else round(f["shortfall_probability"], 4),
+                          shortfall=f["shortfall"])
     log("prediction", request_id=out.request_id, features=X.iloc[0].to_dict(), prediction=out.yield_kg_ha)
     return out
 

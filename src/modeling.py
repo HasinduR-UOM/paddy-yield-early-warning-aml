@@ -10,6 +10,8 @@ Design choices:
 * All preprocessing (imputation, scaling, encoding) lives INSIDE a Pipeline,
   so it is re-fitted on each CV training fold (no preprocessing leakage).
 * Scaling matters for Ridge / SVR / KNN; trees ignore it.
+* NGBoost (the probabilistic model) is tuned on CV CRPS, a proper scoring rule
+  for distributions; all other models are tuned on CV RMSE.
 """
 from __future__ import annotations
 
@@ -41,6 +43,7 @@ from sklearn.tree import DecisionTreeRegressor
 
 from . import config as C
 from .features import CAT_FEATURES, TARGET
+from .probabilistic import NGBRegressor, crps_normal, raw_normal
 
 RS = C.RANDOM_STATE
 
@@ -147,8 +150,43 @@ def model_zoo(features: list[str]) -> dict:
              "model__subsample_freq": [1],
              "model__colsample_bytree": uniform(0.5, 0.5),
              "model__reg_lambda": loguniform(1e-2, 50)}),
+        # NEW algorithm (not covered in lectures): NGBoost predicts a Normal distribution
+        # N(mu, sigma) per row. The base learner is itself a hyperparameter: shallow trees
+        # (non-linear, interactions) or a ridge regression (a heteroscedastic linear model).
+        "NGBoost": (
+            pipe(ngboost_regressor()),
+            [{"model__Base": [DecisionTreeRegressor(max_depth=d, min_samples_leaf=leaf)
+                              for d in (2, 3, 4) for leaf in (10, 30, 60)],
+              "model__n_estimators": randint(150, 800),
+              "model__learning_rate": loguniform(0.005, 0.1),
+              "model__minibatch_frac": uniform(0.5, 0.5),
+              "model__col_sample": uniform(0.5, 0.5)},
+             {"model__Base": [Ridge(alpha=a) for a in (1.0, 10.0, 100.0)],
+              "model__n_estimators": randint(100, 500),
+              "model__learning_rate": loguniform(0.01, 0.1),
+              "model__minibatch_frac": uniform(0.5, 0.5),
+              "model__col_sample": [1.0]}]),
     }
     return zoo
+
+
+def ngboost_regressor(**kw):
+    from ngboost.distns import Normal
+    from ngboost.scores import LogScore
+    params = {"Dist": Normal, "Score": LogScore, "n_estimators": 400, "learning_rate": 0.02,
+              "Base": DecisionTreeRegressor(max_depth=3, min_samples_leaf=10),
+              "verbose": False, "random_state": RS}
+    params.update(kw)
+    return NGBRegressor(**params)
+
+
+def crps_scorer(estimator, X, y) -> float:
+    """Negative mean CRPS (kg/ha) so that RandomizedSearchCV can maximise it."""
+    mu, sigma = raw_normal(estimator, X)
+    return -float(np.mean(crps_normal(np.asarray(y), mu, sigma)))
+
+
+PROBABILISTIC = {"NGBoost"}   # tuned on CV CRPS instead of CV RMSE
 
 
 # --------------------------------------------------------------------------
@@ -190,17 +228,23 @@ def tune_all(train: pd.DataFrame, features: list[str], n_iter: int = 30,
         if only and name not in only:
             continue
         t0 = time.time()
-        search = RandomizedSearchCV(est, space, n_iter=n_iter, cv=folds,
-                                    scoring="neg_root_mean_squared_error",
+        prob = name in PROBABILISTIC
+        scoring = ({"crps": crps_scorer, "rmse": "neg_root_mean_squared_error"} if prob
+                   else "neg_root_mean_squared_error")
+        search = RandomizedSearchCV(est, space, n_iter=n_iter, cv=folds, scoring=scoring,
                                     random_state=RS, n_jobs=-1,
-                                    refit=True, error_score="raise")
+                                    refit="crps" if prob else True, error_score="raise")
         search.fit(X, y)
-        results[name] = {"search": search, "cv_rmse": -search.best_score_,
-                         "cv_rmse_std": float(search.cv_results_["std_test_score"][search.best_index_]),
+        cvr, i = search.cv_results_, search.best_index_
+        key = "rmse" if prob else "score"
+        results[name] = {"search": search, "cv_rmse": -float(cvr[f"mean_test_{key}"][i]),
+                         "cv_rmse_std": float(cvr[f"std_test_{key}"][i]),
+                         "cv_crps": -float(cvr["mean_test_crps"][i]) if prob else None,
                          "fit_s": time.time() - t0}
         if verbose:
+            extra = f"  CV CRPS {results[name]['cv_crps']:6.1f}" if prob else ""
             print(f"{name:18s} CV RMSE {results[name]['cv_rmse']:7.1f} "
-                  f"(+/- {results[name]['cv_rmse_std']:.1f})  [{results[name]['fit_s']:.0f}s]")
+                  f"(+/- {results[name]['cv_rmse_std']:.1f}){extra}  [{results[name]['fit_s']:.0f}s]")
     return results
 
 

@@ -15,6 +15,8 @@ dependencies = [
     "pdfplumber>=0.11",
     "openpyxl>=3.1",
     "pyyaml>=6.0",
+    "ngboost>=0.5",
+    "streamlit>=1.66.1",
 ]
 
 [project.optional-dependencies]
@@ -37,3 +39,4 @@ ignore = ["E501", "E731", "E702"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]

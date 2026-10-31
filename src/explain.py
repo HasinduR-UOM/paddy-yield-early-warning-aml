@@ -4,6 +4,11 @@ SHAP (SHapley Additive exPlanations)
   * Tree models -> shap.TreeExplainer on the model inside the pipeline (exact,
     fast). One-hot / missing-indicator columns are summed back to the original
     feature so plots show "district", not 25 dummy columns.
+  * NGBoost -> explains each predicted PARAMETER separately: the mean (loc,
+    in kg/ha) and the spread (log sigma). With ridge base learners the boosted
+    ensemble is a sum of linear models, i.e. one linear model per parameter, so
+    exact (interventional) SHAP values are coefficient x (x - background mean).
+    With tree base learners shap.TreeExplainer(model_output=k) is used.
   * Other models (Ridge, SVR, KNN) -> model-agnostic permutation
     explainer on the raw features.
 LIME (Local Interpretable Model-agnostic Explanations)
@@ -58,19 +63,95 @@ def is_tree_pipeline(model) -> bool:
 def _group(values: np.ndarray, cols: list[str], features: list[str]) -> np.ndarray:
     """Sum transformed-column SHAP values back to original features."""
     out = np.zeros((values.shape[0], len(features)))
+    index = {f: i for i, f in enumerate(features)}
     for j, col in enumerate(cols):
         src = col.replace("missingindicator_", "")
-        for i, f in enumerate(features):
-            if src == f or (f in CAT_FEATURES and src.startswith(f + "_")):
-                out[:, i] += values[:, j]
+        if src in index:                      # numeric feature (or its missing indicator)
+            out[:, index[src]] += values[:, j]
+            continue
+        # one-hot column "<categorical>_<level>"; match the longest categorical name so that
+        # e.g. "season_year" is never mistaken for a level of "season"
+        for f in sorted((f for f in features if f in CAT_FEATURES), key=len, reverse=True):
+            if src.startswith(f + "_"):
+                out[:, index[f]] += values[:, j]
                 break
     return out
 
 
+# --------------------------------------------------------------------------
+# NGBoost: SHAP for the mean and for the spread
+# --------------------------------------------------------------------------
+def _ngb_parts(model):
+    """(pipeline, NGBRegressor, sigma_scale) if `model` is an NGBoost model, else None."""
+    from .probabilistic import NormalForecaster
+    k = 1.0
+    if isinstance(model, NormalForecaster):
+        k = float(model.sigma_scale)
+        model = model._inner()
+    final = _final(model)
+    if not hasattr(final, "pred_dist"):
+        return None
+    return model, final, k
+
+
+def is_ngboost(model) -> bool:
+    return _ngb_parts(model) is not None
+
+
+def ngboost_linear_coefficients(ngb, n_cols: int) -> tuple[np.ndarray, np.ndarray]:
+    """Collapse a ridge-based NGBoost ensemble into one linear model per parameter.
+
+    params(x) = init - lr * sum_i s_i * (x[cols_i] . coef_ij + b_ij), so the effective
+    weights are W[j] = -lr * sum_i s_i[j] * coef_ij (scattered to the sampled columns)."""
+    n_par = len(ngb.init_params)
+    W = np.zeros((n_par, n_cols))
+    b = np.array(ngb.init_params, dtype=float)
+    for models, s, cols in zip(ngb.base_models, ngb.scalings, ngb.col_idxs):
+        s = np.broadcast_to(np.ravel(np.asarray(s, dtype=float)), (n_par,))  # one line-search scale per stage
+        for j, m in enumerate(models):
+            W[j, cols] -= ngb.learning_rate * s[j] * np.ravel(m.coef_)
+            b[j] -= ngb.learning_rate * s[j] * float(m.intercept_)
+    return W, b
+
+
+def ngboost_shap(model, X: pd.DataFrame, features: list[str], background: pd.DataFrame,
+                 param: str = "loc") -> shap.Explanation:
+    """SHAP over the original features for NGBoost's `loc` (kg/ha) or `scale` (log sigma)."""
+    pipe, ngb, k = _ngb_parts(model)
+    j = {"loc": 0, "scale": 1}[param]
+    pre = pipe[:-1] if hasattr(pipe, "steps") else None
+    Xt = pre.transform(X[features]) if pre is not None else X[features]
+    Bt = pre.transform(background[features]) if pre is not None else background[features]
+    cols = list(Xt.columns)
+    if all(hasattr(m, "coef_") for ms in ngb.base_models for m in ms):
+        W, b = ngboost_linear_coefficients(ngb, Xt.shape[1])
+        mean_bg = Bt.to_numpy(dtype=float).mean(0)
+        vals = (Xt.to_numpy(dtype=float) - mean_bg) * W[j]
+        base = float(b[j] + mean_bg @ W[j])
+    else:
+        explainer = shap.TreeExplainer(ngb, model_output=j)
+        vals = np.asarray(explainer.shap_values(Xt))
+        base = float(np.ravel(explainer.expected_value)[0])
+    if param == "scale":
+        base += np.log(k)          # calibration multiplies sigma by k: a constant shift in log sigma
+    grouped = _group(vals, cols, features)
+    return shap.Explanation(values=grouped, base_values=np.repeat(base, len(Xt)), data=X[features].to_numpy(),
+                            feature_names=features)
+
+
 def shap_explanation(model, X: pd.DataFrame, features: list[str],
                      background: pd.DataFrame | None = None, max_evals: int = 800) -> shap.Explanation:
-    """Return a shap.Explanation over the ORIGINAL features for rows of X."""
+    """Return a shap.Explanation over the ORIGINAL features for rows of X.
+
+    For NGBoost this explains the expected yield (loc, kg/ha). Wrap the model in
+    probabilistic.SigmaView to explain the spread instead (values in log sigma)."""
+    from .probabilistic import SigmaView
     X = X[features]
+    bg_ng = background if background is not None else X
+    if isinstance(model, SigmaView) and is_ngboost(model.model):
+        return ngboost_shap(model.model, X, features, bg_ng, "scale")
+    if is_ngboost(model):
+        return ngboost_shap(model, X, features, bg_ng, "loc")
     if is_tree_pipeline(model):
         pre, est = model.named_steps["pre"], _final(model)
         Xt = pre.transform(X)

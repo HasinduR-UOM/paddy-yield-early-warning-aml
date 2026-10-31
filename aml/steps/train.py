@@ -3,8 +3,8 @@
     python -m aml.steps.train --table <folder with model_table.csv> --n-iter 30 --out <output folder>
 
 The output folder is what gets registered as the Azure ML model:
-    models/final_model.joblib, app_metadata.json, metrics.json, cv_results.csv,
-    test_metrics.csv, figures/ (if the notebooks were run)
+    models/final_model.joblib (calibrated NGBoost), app_metadata.json, metrics.json,
+    cv_results.csv, test_metrics.csv, prob_metrics.csv, test_predictions.csv
 MLflow logging goes to the job automatically (see src/tracking.py).
 """
 from __future__ import annotations
@@ -31,7 +31,8 @@ def main() -> None:
     out = Path(a.out)
     (out / "models").mkdir(parents=True, exist_ok=True)
     shutil.copy(C.MODELS / "final_model.joblib", out / "models" / "final_model.joblib")
-    for f in ("app_metadata.json", "metrics.json", "cv_results.csv", "test_metrics.csv", "test_predictions.csv"):
+    for f in ("app_metadata.json", "metrics.json", "cv_results.csv", "test_metrics.csv", "prob_metrics.csv",
+              "test_predictions.csv"):
         if (C.ARTIFACTS / f).exists():
             shutil.copy(C.ARTIFACTS / f, out / f)
     print(f"Model folder written to {out}")

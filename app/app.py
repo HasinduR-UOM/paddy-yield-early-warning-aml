@@ -4,8 +4,11 @@
 
 Loads artifacts/models/final_model.joblib and artifacts/app_metadata.json
 (written by `python -m src.train`), takes a district / season and a weather
-scenario, predicts yield, flags a shortfall and explains the prediction with
-SHAP and LIME.
+scenario, and shows:
+  * the NGBoost forecast as a distribution: expected yield, 80 % interval and
+    the probability of a shortfall (yield < 85 % of the 5-season mean);
+  * SHAP and LIME explanations of the expected yield, and SHAP for the
+    forecast uncertainty (what makes this season harder to predict).
 """
 import json
 import sys
@@ -21,6 +24,8 @@ import streamlit as st
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from src import explain as E  # noqa: E402
+from src.inference import forecast  # noqa: E402
+from src.probabilistic import SigmaView  # noqa: E402
 
 ART = ROOT / "artifacts"
 st.set_page_config(page_title="Paddy Yield Early Warning - Sri Lanka", page_icon="🌾", layout="wide")
@@ -51,8 +56,9 @@ WEATHER_RAIN = ["rain_total", "rain_establish", "rain_late", "rain_max5d"]
 
 
 st.title("🌾 Paddy Yield Early Warning — Sri Lanka")
-st.caption(f"District-level pre-harvest yield forecast · model: **{meta['best_model']}** · "
-           f"trained on seasons {meta['trained_on']} · DCS paddy statistics + ERA5 weather")
+st.caption(f"District-level pre-harvest yield forecast · model: **{meta['best_model']}** "
+           f"(probabilistic: predicts a distribution, not one number) · trained on seasons {meta['trained_on']} · "
+           f"DCS paddy statistics + ERA5 weather")
 
 tab_fc, tab_models, tab_about = st.tabs(["Forecast", "Model comparison", "About"])
 
@@ -133,32 +139,65 @@ with tab_fc:
             row[f] = vals.get(f, clim.get(f, np.nan))
     X = pd.DataFrame([row])[F]
 
-    pred = float(model.predict(X)[0])
     ref = dflt["yield_mean5_same"]
+    fc = forecast(model, meta, X, ref)
+    pred, thr, p_short = fc["yield_kg_ha"], fc["shortfall_threshold_kg_ha"], fc["shortfall_probability"]
     ratio = pred / ref
     production = pred * sown * dflt["harvest_ratio"] / 1000
-    shortfall = ratio < meta["shortfall_threshold"]
+    shortfall = fc["shortfall"]
+    probabilistic = p_short is not None
 
     st.divider()
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Forecast yield", f"{pred:,.0f} kg/ha", f"{100 * (ratio - 1):+.1f} % vs 5-season mean")
-    m2.metric("Estimated production", f"{production:,.0f} t", help="yield × sown extent × typical harvested/sown ratio")
-    m3.metric("5-season mean", f"{ref:,.0f} kg/ha")
-    m4.metric("Status", "⚠️ SHORTFALL" if shortfall else "✅ Normal",
-              help=f"Shortfall = forecast below {int(meta['shortfall_threshold'] * 100)} % of the 5-season mean")
+    m1.metric("Expected yield", f"{pred:,.0f} kg/ha", f"{100 * (ratio - 1):+.1f} % vs 5-season mean")
+    if probabilistic:
+        lo, hi = fc["interval_80"]
+        m2.metric("80 % range", f"{lo:,.0f} – {hi:,.0f}",
+                  help="The actual yield should fall inside this range 8 times out of 10")
+        m3.metric("Chance of a shortfall", f"{100 * p_short:.0f} %",
+                  help=f"P(yield < {thr:,.0f} kg/ha), i.e. below {int(meta['shortfall_threshold'] * 100)} % "
+                       f"of the 5-season mean ({ref:,.0f} kg/ha)")
+    else:
+        m2.metric("5-season mean", f"{ref:,.0f} kg/ha")
+        m3.metric("Estimated production", f"{production:,.0f} t")
+    m4.metric("Status", "⚠️ SHORTFALL RISK" if shortfall else "✅ Normal",
+              help=(f"Flag raised when the shortfall probability reaches {100 * fc['probability_cut']:.0f} % "
+                    "(cut-off chosen on the cross-validation folds)") if probabilistic else
+                   f"Shortfall = forecast below {int(meta['shortfall_threshold'] * 100)} % of the 5-season mean")
+    st.caption(f"Estimated production ≈ {production:,.0f} t (yield × sown extent × typical harvested/sown ratio)")
 
     hist = pd.DataFrame(dflt["history"], columns=["season_year", "yield_kg_ha"])
-    fig, ax = plt.subplots(figsize=(9, 3))
-    ax.plot(hist.season_year, hist.yield_kg_ha, "o-", color="#2a7ab9", label="observed")
-    ax.plot([year], [pred], "D", ms=10, color="#c0504d" if shortfall else "#3a9a5b", label="forecast")
-    ax.axhline(ref * meta["shortfall_threshold"], ls="--", c="grey", lw=1, label="shortfall threshold")
-    ax.set_ylabel("kg/ha"); ax.set_title(f"{district} — {season}"); ax.legend(loc="lower left", fontsize=8)
-    st.pyplot(fig, width="stretch")
+    g1, g2 = st.columns([3, 2]) if probabilistic else (st.container(), None)
+    with g1:
+        fig, ax = plt.subplots(figsize=(8, 3.4))
+        ax.plot(hist.season_year, hist.yield_kg_ha, "o-", color="#2a7ab9", label="observed")
+        colour = "#c0504d" if shortfall else "#3a9a5b"
+        if probabilistic:
+            ax.errorbar([year], [pred], yerr=[[pred - lo], [hi - pred]], fmt="D", ms=9, color=colour,
+                        capsize=6, lw=2, label="forecast, 80 % range")
+        else:
+            ax.plot([year], [pred], "D", ms=10, color=colour, label="forecast")
+        ax.axhline(thr, ls="--", c="grey", lw=1, label="shortfall threshold")
+        ax.set_ylabel("kg/ha"); ax.set_title(f"{district} — {season}"); ax.legend(loc="lower left", fontsize=8)
+        st.pyplot(fig, width="stretch")
+    if probabilistic:
+        with g2:
+            from scipy.stats import norm
+            s_ = fc["sigma_kg_ha"]
+            xs = np.linspace(pred - 4 * s_, pred + 4 * s_, 300)
+            fig3, ax3 = plt.subplots(figsize=(5, 3.4))
+            ax3.plot(xs, norm.pdf(xs, pred, s_), color="#16302A")
+            ax3.fill_between(xs, norm.pdf(xs, pred, s_), where=xs < thr, color="#c0504d", alpha=.45,
+                             label=f"shortfall: {100 * p_short:.0f} %")
+            ax3.axvline(thr, ls="--", c="grey", lw=1)
+            ax3.set_yticks([]); ax3.set_xlabel("yield kg/ha"); ax3.set_title("Forecast distribution (NGBoost)")
+            ax3.legend(fontsize=8, loc="upper right")
+            st.pyplot(fig3, width="stretch")
 
     st.subheader("Why this forecast?")
     e1, e2 = st.columns(2)
     with e1:
-        st.markdown("**SHAP** — contribution of each feature (kg/ha) from the average forecast")
+        st.markdown("**SHAP** — contribution of each feature (kg/ha) to the expected yield")
         with st.spinner("Computing SHAP ..."):
             ex = E.shap_explanation(model, X, F, background=train.sample(min(200, len(train)), random_state=0),
                                     max_evals=2 * len(F) + 1 if not E.is_tree_pipeline(model) else 800)
@@ -179,10 +218,25 @@ with tab_fc:
         st.pyplot(fig2, width="stretch")
         st.caption(f"LIME surrogate prediction {exp.local_pred[0]:,.0f} kg/ha (surrogate R² {exp.score:.2f})")
 
+    if probabilistic and getattr(model, "is_ngboost", False):
+        with st.expander("What makes this forecast more or less certain? (SHAP on the predicted spread σ)"):
+            with st.spinner("Computing SHAP for σ ..."):
+                ex_s = E.shap_explanation(SigmaView(model), X, F,
+                                          background=train.sample(min(200, len(train)), random_state=0),
+                                          max_evals=2 * len(F) + 1)
+            plt.figure()
+            shap.plots.waterfall(ex_s[0], max_display=8, show=False)
+            st.pyplot(plt.gcf(), width="stretch")
+            plt.close("all")
+            st.caption("Positive values widen the forecast distribution (less certain); negative values narrow it. "
+                       f"σ for this season: {fc['sigma_kg_ha']:,.0f} kg/ha.")
+
     top = pd.Series(ex.values[0], index=F).sort_values()
     neg, pos = top.head(2), top.tail(2)[::-1]
+    risk = (f" There is a **{100 * p_short:.0f} %** chance that yield falls below the shortfall threshold "
+            f"of {thr:,.0f} kg/ha." if probabilistic else "")
     st.info(
-        f"**Plain-language summary.** The model forecasts **{pred:,.0f} kg/ha** for {district} {season} {year}. "
+        f"**Plain-language summary.** The model expects **{pred:,.0f} kg/ha** for {district} {season} {year}.{risk} "
         f"Biggest upward drivers: {', '.join(f'{k} (+{v:,.0f})' for k, v in pos.items() if v > 0) or 'none'}. "
         f"Biggest downward drivers: {', '.join(f'{k} ({v:,.0f})' for k, v in neg.items() if v < 0) or 'none'}.")
 
@@ -194,9 +248,16 @@ with tab_fc:
 with tab_models:
     st.subheader("Cross-validation (model selection, seasons ≤ %d)" % meta["train_end"])
     st.dataframe(pd.DataFrame(meta["cv_table"]).round(1), width="stretch")
-    st.subheader("Held-out test seasons (> %d)" % meta["train_end"])
+    st.subheader("Held-out test seasons (> %d): point forecasts" % meta["train_end"])
     st.dataframe(pd.DataFrame(meta["test_table"]).round(3), width="stretch")
+    if meta.get("prob_table"):
+        st.subheader("Probabilistic forecasts: NGBoost vs Ridge with Normal errors")
+        st.caption("CRPS = error of the whole forecast distribution in kg/ha (lower is better). Coverage = share of "
+                   "actual yields inside the 80 % range (ideal 0.80). Shortfall metrics use P(shortfall).")
+        st.dataframe(pd.DataFrame(meta["prob_table"]).set_index("model").T.round(3), width="stretch")
     for f, cap in [("cv_rmse.png", "CV RMSE by model"), ("test_pred_vs_actual.png", "Test: predicted vs actual"),
+                   ("ngb_calibration.png", "NGBoost: calibration of the forecast distribution"),
+                   ("ngb_shortfall_pr.png", "Shortfall probability: precision-recall"),
                    ("shap_beeswarm.png", "Global SHAP summary")]:
         p = ART / "figures" / f
         if p.exists():
@@ -211,8 +272,11 @@ season will fall short, so stocks, imports and support can be arranged early.
 ERA5 daily weather via the Open-Meteo historical API (one paddy-area point per district);
 NOAA Oceanic Niño Index.
 
-**Model.** Several model families were tuned with expanding-window cross-validation on seasons up to the
-training cut-off and tested on later seasons. The selected model was then re-fitted on all seasons for this app.
+**Model.** Nine model families were tuned with expanding-window cross-validation on seasons up to the
+training cut-off and tested on later seasons. The app uses **NGBoost** (Natural Gradient Boosting), which predicts a
+Normal distribution for each district-season instead of a single number: an expected yield, an uncertainty (σ) and,
+from those, the probability of a shortfall. Its intervals were calibrated on the cross-validation folds. The model was
+then re-fitted on all seasons for this app.
 
 **Limits.** One weather point per district; shocks outside the training history (e.g. the 2021/22 fertilizer
 ban) cannot be learned from weather; forecasts are for planning support, not official statistics.

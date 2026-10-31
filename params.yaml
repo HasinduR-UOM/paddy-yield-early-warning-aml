@@ -1,8 +1,9 @@
 # Single source of truth for pipeline settings (read by src/* and the Azure ML pipeline).
 train:
   n_iter: 30           # RandomizedSearchCV draws per model
+  selected_model: NGBoost   # deployed model: the early warning needs P(shortfall), which only NGBoost gives
 gate:
-  metric: test_rmse_normal   # RMSE (kg/ha) on test seasons excluding the fertilizer crisis
+  metric: test_crps_normal   # CRPS (kg/ha) of the forecast distribution on test seasons excluding the fertilizer crisis
   tolerance: 0.0             # challenger must be <= champion + tolerance
 monitor:
   drift_share_threshold: 0.3 # retrain if >= 30 % of weather features drift

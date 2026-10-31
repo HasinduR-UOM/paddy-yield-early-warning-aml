@@ -48,3 +48,32 @@ def build_row(meta: dict, district: str, season: str, season_year: int | None = 
     row.update(overrides or {})
     X = pd.DataFrame([{f: row.get(f, np.nan) for f in meta["features"]}])
     return X, d
+
+
+def forecast(model, meta: dict, X: pd.DataFrame, ref: float) -> dict:
+    """Point forecast, 80 % interval and shortfall probability for one row.
+
+    `ref` is the district's 5-season same-season mean; a shortfall means
+    yield < shortfall_threshold x ref. For a probabilistic model (NGBoost) the
+    flag is raised when P(shortfall) reaches the cut-off chosen on the CV folds;
+    for a point model it falls back to comparing the point forecast with the
+    threshold."""
+    from scipy.stats import norm
+
+    from .probabilistic import Z80, predict_normal
+
+    mu, sigma = predict_normal(model, X)
+    mu = float(mu[0])
+    thr = meta["shortfall_threshold"] * ref
+    out = {"yield_kg_ha": mu, "five_season_mean_kg_ha": float(ref), "change_pct": 100 * (mu / ref - 1),
+           "shortfall_threshold_kg_ha": thr}
+    if sigma is None:
+        out.update({"sigma_kg_ha": None, "interval_80": None, "shortfall_probability": None,
+                    "shortfall": bool(mu < thr)})
+    else:
+        s = float(sigma[0])
+        p = float(norm.cdf((thr - mu) / s))
+        cut = float(meta.get("probabilistic", {}).get("prob_cut", 0.5))
+        out.update({"sigma_kg_ha": s, "interval_80": [float(mu - Z80 * s), float(mu + Z80 * s)],
+                    "shortfall_probability": p, "shortfall": bool(p >= cut), "probability_cut": cut})
+    return out
