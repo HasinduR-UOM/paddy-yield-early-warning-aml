@@ -48,13 +48,35 @@ jobs:
           az extension add -n ml --upgrade -y -o none
           az configure --defaults group=${{ vars.AZURE_RESOURCE_GROUP }} workspace=${{ vars.AZURE_ML_WORKSPACE }}
 
-      - name: Refresh raw data asset
+      - name: Refresh raw data
         if: env.REFRESH == 'true'
         run: |
+          # Start from the current paddy-raw asset, so weather only needs the recent days
+          # and a district Open-Meteo refuses keeps last month's complete file
+          P=$(az ml data show -n paddy-raw --label latest --query path -o tsv)
+          REL=${P#*/paths/}
+          ACCOUNT=$(az ml datastore show -n workspaceblobstore --query account_name -o tsv)
+          CONTAINER=$(az ml datastore show -n workspaceblobstore --query container_name -o tsv)
+          az storage blob download-batch --account-name "$ACCOUNT" -s "$CONTAINER" --pattern "${REL}*" \
+                -d seed --auth-mode key -o none
+          cp -r "seed/${REL}." data/raw/
           uv run python -m src.dcs download --force
-          uv run python -m src.weather --force
-          uv run python -m src.weather oni
-          az ml data create --name paddy-raw --version "$(date +%Y%m%d%H%M)" --type uri_folder --path data/raw -o none
+          uv run python -m src.weather --update      # also refreshes ONI
+          N=$(ls data/raw/weather/*.csv | wc -l)
+          echo "Weather files: $N"
+          test "$N" -ge 25
+
+      # The OIDC login from the start of the job expires after a few minutes
+      - uses: azure/login@v2
+        if: env.REFRESH == 'true'
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Upload raw data asset
+        if: env.REFRESH == 'true'
+        run: az ml data create --name paddy-raw --version "$(date +%Y%m%d%H%M)" --type uri_folder --path data/raw -o none
 
       - name: Run Azure ML pipeline
         id: job
